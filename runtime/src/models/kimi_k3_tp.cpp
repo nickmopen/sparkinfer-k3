@@ -466,13 +466,23 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
             R.phase_graph.assign(want, nullptr);
             R.phase_exec.assign(want, nullptr);
             R.phase_ready.assign(want, 0);
+            R.phase_warm.assign(want, 0);
             R.phase_x.assign(want, nullptr);
         }
         size_t slot = want;
         if (R.phase_ready[base] && R.phase_x[base] == R.x)          slot = base;
         else if (R.phase_ready[base+1] && R.phase_x[base+1] == R.x) slot = base + 1;
         if (slot == want) {                                  // capture this parity
-            slot = R.phase_ready[base] ? base + 1 : base;
+            // Warm up once first: the kernels lazily allocate their scratch (e.g. the
+            // MLA partial banks) and set func attributes on first use, and cudaMalloc
+            // during capture invalidates the capture. Running the phase normally once
+            // moves that one-time work outside the captured region.
+            const size_t wslot = R.phase_ready[base] ? base + 1 : base;
+            if (!R.phase_warm[wslot]) {
+                R.phase_warm[wslot] = 1;
+                return kimi_k3_forward_layer_phase(R.fwd, layer, ph, R.x, R.x_next);
+            }
+            slot = wslot;
             cudaError_t eb = cudaStreamBeginCapture(R.stream, cudaStreamCaptureModeThreadLocal);
             if (eb != cudaSuccess) {
                 std::fprintf(stderr, "[k3-graph] begin L%d ph%d: %s\n", layer, (int)ph, cudaGetErrorString(eb));

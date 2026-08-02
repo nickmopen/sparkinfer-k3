@@ -136,6 +136,7 @@ struct KimiK3TPRank {
     std::vector<cudaGraph_t>     phase_graph;
     std::vector<cudaGraphExec_t> phase_exec;
     std::vector<unsigned char>   phase_ready;
+    std::vector<unsigned char>   phase_warm;   // ran once outside capture (lazy init)
     std::vector<const float*>    phase_x;      // which x this slot captured (ping-pong parity)
 };
 

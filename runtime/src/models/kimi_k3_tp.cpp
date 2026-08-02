@@ -685,6 +685,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         const size_t want = (size_t)cfg.n_layers * 2;
         if (p.layer_ready.size() != want) {
             p.layer_ready.assign(want, 0); p.layer_warm.assign(want, 0);
+            p.layer_ckpt_d.assign(want, 0); p.layer_swap.assign(want, 0);
             p.layer_x.assign(want, nullptr);
             p.layer_exec.assign(want * p.ranks.size(), nullptr);
         }
@@ -701,6 +702,11 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                 continue;
             }
             capturing = true;          // thread pool + per-thread capture do not mix
+            // Replaying a graph re-runs only the GPU work, so the host-side state the
+            // layer body mutates (the x/x_next swap, and n_ckpt which the head reads)
+            // would never advance. Record the delta here and re-apply it on every replay.
+            const int ckpt_before = p.ranks[0].state.n_ckpt;
+            const float* x_before = p.ranks[0].x;
             bool cok = true;
             for (size_t r = 0; r < p.ranks.size() && cok; ++r) {
                 cudaSetDevice(p.ranks[r].device);
@@ -720,12 +726,19 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
             }
             capturing = false;
             if (!ok || !cok) { std::fprintf(stderr, "[k3-graph] capture failed at layer %d\n", layer); return false; }
+            p.layer_ckpt_d[ws] = (unsigned char)(p.ranks[0].state.n_ckpt - ckpt_before);
+            p.layer_swap[ws]   = (unsigned char)(p.ranks[0].x != x_before);
             p.layer_x[ws] = key; p.layer_ready[ws] = 1; slot = ws;
         }
         for (size_t r = 0; r < p.ranks.size(); ++r) {
             cudaSetDevice(p.ranks[r].device);
             if (cudaGraphLaunch(p.layer_exec[slot * p.ranks.size() + r], p.ranks[r].stream) != cudaSuccess)
                 return false;
+        }
+        // The GPU work replayed; now advance the host state the body would have.
+        for (auto& R : p.ranks) {
+            R.state.n_ckpt += (int)p.layer_ckpt_d[slot];
+            if (p.layer_swap[slot]) std::swap(R.x, R.x_next);
         }
     }
 

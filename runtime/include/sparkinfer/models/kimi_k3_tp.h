@@ -142,6 +142,8 @@ struct KimiK3TP {
     std::vector<unsigned char>   layer_ready;
     std::vector<unsigned char>   layer_warm;    // ran once outside capture (lazy init)
     std::vector<const float*>    layer_x;
+    std::vector<unsigned char>   layer_ckpt_d;  // n_ckpt the body added (replay re-applies)
+    std::vector<unsigned char>   layer_swap;    // body swapped x/x_next
 
     KimiK3Config cfg;
     K3PlanOptions opt;

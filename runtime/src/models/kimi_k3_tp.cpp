@@ -431,6 +431,8 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         return e && e[0] == '1';
     }();
     const bool parallel_issue = (tp_size > 1) && !serial_issue;
+    bool capturing = false;   // set while a layer is being captured: the pool's worker
+                              // threads cannot drive a thread-local stream capture.
     if (parallel_issue && !p.issue.started()) {
         std::vector<int> devs;
         devs.reserve(p.ranks.size());
@@ -454,56 +456,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         return ph == K3LayerPhase::Attn && !cfg.is_kda_layer(layer);   // MLA only
     };
     auto run_phase = [&](KimiK3TPRank& R, int layer, K3LayerPhase ph) -> bool {
-        if (!graph_on || pos_dependent(layer, ph))
-            return kimi_k3_forward_layer_phase(R.fwd, layer, ph, R.x, R.x_next);
-        // x/x_next ping-pong once per layer, and 93 layers is odd, so a token ends
-        // with the pair exchanged: layer L sees the opposite assignment on alternate
-        // tokens. A graph bakes its pointers in, so the cache is keyed on R.x and
-        // holds both parities -- 2 slots per (layer, phase).
-        const size_t base = ((size_t)layer * 4 + (size_t)ph) * 2;
-        const size_t want = (size_t)cfg.n_layers * 4 * 2;
-        if (R.phase_ready.size() != want) {
-            R.phase_graph.assign(want, nullptr);
-            R.phase_exec.assign(want, nullptr);
-            R.phase_ready.assign(want, 0);
-            R.phase_warm.assign(want, 0);
-            R.phase_x.assign(want, nullptr);
-        }
-        size_t slot = want;
-        if (R.phase_ready[base] && R.phase_x[base] == R.x)          slot = base;
-        else if (R.phase_ready[base+1] && R.phase_x[base+1] == R.x) slot = base + 1;
-        if (slot == want) {                                  // capture this parity
-            // Warm up once first: the kernels lazily allocate their scratch (e.g. the
-            // MLA partial banks) and set func attributes on first use, and cudaMalloc
-            // during capture invalidates the capture. Running the phase normally once
-            // moves that one-time work outside the captured region.
-            const size_t wslot = R.phase_ready[base] ? base + 1 : base;
-            if (!R.phase_warm[wslot]) {
-                R.phase_warm[wslot] = 1;
-                return kimi_k3_forward_layer_phase(R.fwd, layer, ph, R.x, R.x_next);
-            }
-            slot = wslot;
-            cudaError_t eb = cudaStreamBeginCapture(R.stream, cudaStreamCaptureModeThreadLocal);
-            if (eb != cudaSuccess) {
-                std::fprintf(stderr, "[k3-graph] begin L%d ph%d: %s\n", layer, (int)ph, cudaGetErrorString(eb));
-                return kimi_k3_forward_layer_phase(R.fwd, layer, ph, R.x, R.x_next);
-            }
-            const bool ok = kimi_k3_forward_layer_phase(R.fwd, layer, ph, R.x, R.x_next);
-            const cudaError_t eafter = cudaGetLastError();
-            cudaGraph_t g = nullptr;
-            const cudaError_t ee = cudaStreamEndCapture(R.stream, &g);
-            if (ee != cudaSuccess || !ok || !g) {
-                std::fprintf(stderr, "[k3-graph] L%d ph%d ok=%d after=%s end=%s\n",
-                             layer, (int)ph, (int)ok, cudaGetErrorString(eafter), cudaGetErrorString(ee));
-                return false;
-            }
-            cudaGraphExec_t e = nullptr;
-            if (cudaGraphInstantiate(&e, g, 0) != cudaSuccess) { cudaGraphDestroy(g); return false; }
-            R.phase_graph[slot] = g; R.phase_exec[slot] = e;
-            R.phase_x[slot] = R.x; R.phase_ready[slot] = 1;
-            // Capture enqueues nothing, so the launch below also makes THIS token correct.
-        }
-        return cudaGraphLaunch(R.phase_exec[slot], R.stream) == cudaSuccess;
+        return kimi_k3_forward_layer_phase(R.fwd, layer, ph, R.x, R.x_next);
     };
 
 
@@ -512,7 +465,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
     // cudaSetDevice; the parallel arm does not need one, because each worker
     // pinned its device once at thread start.
     auto issue_all = [&](const std::function<bool(int)>& job) -> bool {
-        if (parallel_issue) return p.issue.run(job);
+        if (parallel_issue && !capturing) return p.issue.run(job);
         for (int r = 0; r < tp_size; ++r) {
             if (cudaSetDevice(p.ranks[(size_t)r].device) != cudaSuccess) return false;
             if (!job(r)) return false;
@@ -537,7 +490,8 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         }
     }
 
-    for (int layer = 0; layer < cfg.n_layers; ++layer) {
+    // The layer body, hoisted so it can be issued directly OR captured into a graph.
+    auto run_layer = [&](int layer) -> bool {
         const bool is_moe = layer >= cfg.leading_dense;
 
         // --- phase 1 + 2 on every rank -------------------------------------
@@ -714,6 +668,64 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
             ip.t_issue += secs_since(t_p3);
             ip.n_phase_calls += tp_size;
             if (!parallel_issue) ip.n_setdev += tp_size;
+        }
+        return true;
+    };
+
+    for (int layer = 0; layer < cfg.n_layers; ++layer) {
+        // Per-LAYER capture. Per-PHASE was measured 21% SLOWER: ~192 tiny graph
+        // launches cost more than issuing the 10-15 kernels each phase contains, so
+        // the graph has to be big enough to amortise its launch. A whole layer is
+        // ~3 phases plus its collectives -- the collective is capture-safe because the
+        // default peer one-shot path is N kernel launches whose barrier lives in
+        // device memory, not a host event. MLA layers stay uncaptured: host `position`
+        // reaches their kernels as a baked KV pointer and length.
+        const bool cap = graph_on && cfg.is_kda_layer(layer);
+        if (!cap) { if (!run_layer(layer)) return false; continue; }
+        const size_t want = (size_t)cfg.n_layers * 2;
+        if (p.layer_ready.size() != want) {
+            p.layer_ready.assign(want, 0); p.layer_warm.assign(want, 0);
+            p.layer_x.assign(want, nullptr);
+            p.layer_exec.assign(want * p.ranks.size(), nullptr);
+        }
+        const size_t base = (size_t)layer * 2;
+        const float* key = p.ranks[0].x;                 // x/x_next parity (93 swaps = odd)
+        size_t slot = want;
+        if (p.layer_ready[base] && p.layer_x[base] == key)          slot = base;
+        else if (p.layer_ready[base+1] && p.layer_x[base+1] == key) slot = base + 1;
+        if (slot == want) {
+            const size_t ws = p.layer_ready[base] ? base + 1 : base;
+            if (!p.layer_warm[ws]) {   // lazy scratch alloc must happen outside capture
+                p.layer_warm[ws] = 1;
+                if (!run_layer(layer)) return false;
+                continue;
+            }
+            capturing = true;          // thread pool + per-thread capture do not mix
+            bool cok = true;
+            for (size_t r = 0; r < p.ranks.size() && cok; ++r) {
+                cudaSetDevice(p.ranks[r].device);
+                cok = cudaStreamBeginCapture(p.ranks[r].stream,
+                        cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+            }
+            const bool ok = cok && run_layer(layer);
+            for (size_t r = 0; r < p.ranks.size(); ++r) {
+                cudaGraph_t g = nullptr;
+                cudaSetDevice(p.ranks[r].device);
+                if (cudaStreamEndCapture(p.ranks[r].stream, &g) != cudaSuccess || !g) { cok = false; continue; }
+                cudaGraphExec_t e = nullptr;
+                if (cudaGraphInstantiate(&e, g, 0) == cudaSuccess)
+                    p.layer_exec[ws * p.ranks.size() + r] = e;
+                else cok = false;
+                cudaGraphDestroy(g);
+            }
+            capturing = false;
+            if (!ok || !cok) { std::fprintf(stderr, "[k3-graph] capture failed at layer %d\n", layer); return false; }
+            p.layer_x[ws] = key; p.layer_ready[ws] = 1; slot = ws;
+        }
+        for (size_t r = 0; r < p.ranks.size(); ++r) {
+            cudaSetDevice(p.ranks[r].device);
+            if (cudaGraphLaunch(p.layer_exec[slot * p.ranks.size() + r], p.ranks[r].stream) != cudaSuccess)
+                return false;
         }
     }
 

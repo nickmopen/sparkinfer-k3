@@ -129,18 +129,20 @@ struct KimiK3TPRank {
     float* x_next = nullptr;         // [hidden]
     float* logits = nullptr;         // [vocab], rank 0 only
 
-    // Per-(layer, phase) CUDA graphs for the position-INDEPENDENT phases. The host
-    // spends ~43% of a token issuing ~192 phase calls (SPARKINFER_K3_ISSUE_PROFILE);
-    // every phase except MLA attention replays identically each token, so it is
-    // captured once and replayed. Indexed [layer * 4 + int(phase)].
-    std::vector<cudaGraph_t>     phase_graph;
-    std::vector<cudaGraphExec_t> phase_exec;
-    std::vector<unsigned char>   phase_ready;
-    std::vector<unsigned char>   phase_warm;   // ran once outside capture (lazy init)
-    std::vector<const float*>    phase_x;      // which x this slot captured (ping-pong parity)
 };
 
 struct KimiK3TP {
+    // Per-LAYER CUDA graphs (2 parities x n_layers, one exec per rank). The host spends
+    // ~43% of a token issuing phase calls (SPARKINFER_K3_ISSUE_PROFILE); a KDA layer
+    // enqueues the identical kernels over identical buffers every token, so it is
+    // captured once and replayed. MLA layers are excluded (host `position` is baked
+    // into their KV pointer and length). x/x_next ping-pong per layer and 93 is odd,
+    // so a token ends with the pair exchanged -- hence the 2 parities, keyed on x.
+    std::vector<cudaGraphExec_t> layer_exec;    // [slot * n_ranks + rank]
+    std::vector<unsigned char>   layer_ready;
+    std::vector<unsigned char>   layer_warm;    // ran once outside capture (lazy init)
+    std::vector<const float*>    layer_x;
+
     KimiK3Config cfg;
     K3PlanOptions opt;
     std::vector<KimiK3TPRank> ranks;

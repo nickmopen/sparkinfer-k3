@@ -809,11 +809,21 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     // now sized to the expected LOCAL count and each block strides over the local
     // selections, so the grid carries no foreign slices. Any count still works: fewer
     // than grid.y and the surplus blocks find nothing, more and the stride picks them up.
+    // tp_size 1 arrives with n_local_experts = INT_MAX, meaning the band test can never
+    // reject; every selection is local, so the sel-th local one is just sel and the scan
+    // below would be pure overhead on a path this change is not trying to alter.
+    const bool all_local = (n_local_experts == 0x7fffffff);
     for (int sel = blockIdx.y; ; sel += gridDim.y) {
-        int k = -1, cnt = 0;
-        for (int kk = 0; kk < top_k; ++kk) {
-            const int ee = ids[kk] - expert_begin;
-            if (ee >= 0 && ee < n_local_experts) { if (cnt == sel) { k = kk; break; } ++cnt; }
+        int k = -1;
+        if (all_local) {
+            if (sel >= top_k) break;
+            k = sel;
+        } else {
+            int cnt = 0;
+            for (int kk = 0; kk < top_k; ++kk) {
+                const int ee = ids[kk] - expert_begin;
+                if (ee >= 0 && ee < n_local_experts) { if (cnt == sel) { k = kk; break; } ++cnt; }
+            }
         }
         if (k < 0) break;                        // no more local selections for this block
         const int e = ids[k] - expert_begin;

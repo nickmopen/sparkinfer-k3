@@ -473,11 +473,20 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         else if (R.phase_ready[base+1] && R.phase_x[base+1] == R.x) slot = base + 1;
         if (slot == want) {                                  // capture this parity
             slot = R.phase_ready[base] ? base + 1 : base;
-            if (cudaStreamBeginCapture(R.stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
+            cudaError_t eb = cudaStreamBeginCapture(R.stream, cudaStreamCaptureModeThreadLocal);
+            if (eb != cudaSuccess) {
+                std::fprintf(stderr, "[k3-graph] begin L%d ph%d: %s\n", layer, (int)ph, cudaGetErrorString(eb));
                 return kimi_k3_forward_layer_phase(R.fwd, layer, ph, R.x, R.x_next);
+            }
             const bool ok = kimi_k3_forward_layer_phase(R.fwd, layer, ph, R.x, R.x_next);
+            const cudaError_t eafter = cudaGetLastError();
             cudaGraph_t g = nullptr;
-            if (cudaStreamEndCapture(R.stream, &g) != cudaSuccess || !ok || !g) return false;
+            const cudaError_t ee = cudaStreamEndCapture(R.stream, &g);
+            if (ee != cudaSuccess || !ok || !g) {
+                std::fprintf(stderr, "[k3-graph] L%d ph%d ok=%d after=%s end=%s\n",
+                             layer, (int)ph, (int)ok, cudaGetErrorString(eafter), cudaGetErrorString(ee));
+                return false;
+            }
             cudaGraphExec_t e = nullptr;
             if (cudaGraphInstantiate(&e, g, 0) != cudaSuccess) { cudaGraphDestroy(g); return false; }
             R.phase_graph[slot] = g; R.phase_exec[slot] = e;

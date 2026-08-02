@@ -786,13 +786,12 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
                                         const int* __restrict__ ids,
                                         const Blk* __restrict__ gate_exps,
                                         const Blk* __restrict__ up_exps,
-                                        int latent, int ffn,
+                                        int latent, int ffn, int top_k,
                                         float beta, float inv_beta,
                                         float lb, float inv_lb, int lb_active,
                                         int expert_begin, int n_local_experts) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    const int k = blockIdx.y;                                  // which selected expert
     const int j = blockIdx.x * WARPS_PER_CTA + warp;           // which ffn output row
     if (j >= ffn) return;
 
@@ -801,9 +800,23 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     // but this rank stores only experts [expert_begin, expert_begin+n_local).
     // Selections outside that band belong to another rank and contribute ZERO here;
     // the all-reduce that follows sums the bands back into the full top_k combine.
-    const int e = ids[k] - expert_begin;
-    if (e < 0 || e >= n_local_experts) return;   // memset already left this slot at 0
     const int blocks_per_row = latent / 256;
+
+    // WALK ONLY THIS RANK'S SELECTIONS. grid.y used to be top_k, so at tp=8 -- where a
+    // rank holds 112 of 896 experts and about 14 of every 16 selections are foreign --
+    // roughly seven of every eight CTAs existed only to read one id, fail the band test
+    // and exit, inside the kernel that is the largest single share of decode. grid.y is
+    // now sized to the expected LOCAL count and each block strides over the local
+    // selections, so the grid carries no foreign slices. Any count still works: fewer
+    // than grid.y and the surplus blocks find nothing, more and the stride picks them up.
+    for (int sel = blockIdx.y; ; sel += gridDim.y) {
+        int k = -1, cnt = 0;
+        for (int kk = 0; kk < top_k; ++kk) {
+            const int ee = ids[kk] - expert_begin;
+            if (ee >= 0 && ee < n_local_experts) { if (cnt == sel) { k = kk; break; } ++cnt; }
+        }
+        if (k < 0) break;                        // no more local selections for this block
+        const int e = ids[k] - expert_begin;
 
     const Blk* g_row = gate_exps + (size_t)(e * ffn + j) * blocks_per_row;
     const Blk* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
@@ -825,6 +838,7 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
         const float a  = beta * tanhf(gacc * inv_beta) * sigmoidf_(gacc);
         const float ub = lb_active ? (lb * tanhf(uacc * inv_lb)) : uacc;
         scratch[(size_t)k * ffn + j] = a * ub;
+    }
     }
 }
 
@@ -2567,13 +2581,22 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
     // so the bases alone decide it.
     const bool xvec = ((((uintptr_t)x) | ((uintptr_t)scratch)) & 15u) == 0;
 
-    const dim3 g1((unsigned)((ffn + WARPS - 1) / WARPS), (unsigned)top_k);
+    // grid.y carried one slice per SELECTED expert, but a banded rank owns only a
+    // fraction of them: at tp=8, ~14 of 16 slices were CTAs that read one id, failed the
+    // band test and exited. Size it to the expected LOCAL count instead and let the
+    // kernel stride; a rank that happens to own more still gets them, just serially.
+    // tp_size 1 (n_local_experts <= 0) keeps grid.y = top_k, so that path is unchanged.
+    constexpr int SEL_SLOTS = 4;
+    const unsigned gy = (n_local_experts > 0)
+        ? (unsigned)((top_k < SEL_SLOTS) ? top_k : SEL_SLOTS)
+        : (unsigned)top_k;
+    const dim3 g1((unsigned)((ffn + WARPS - 1) / WARPS), gy);
     const size_t dshm = (size_t)top_k * sizeof(float);
     const float inv_lb = lb_active ? 1.0f / situ_linear_beta : 1.0f;
 
     if (xvec) {
         moe_gate_up_situ_kernel<WARPS, true, Blk><<<g1, WARPS * 32, 0, stream>>>(
-            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn, top_k,
             situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
             expert_begin, n_local);
         moe_down_combine_kernel<WARPS, true, Blk>
@@ -2582,7 +2605,7 @@ static void moe_expert_ffn_launch(float* out, float* scratch,
                 expert_begin, n_local);
     } else {
         moe_gate_up_situ_kernel<WARPS, false, Blk><<<g1, WARPS * 32, 0, stream>>>(
-            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn,
+            scratch, x, ids, (const Blk*)gate_exps, (const Blk*)up_exps, latent, ffn, top_k,
             situ_beta, 1.0f / situ_beta, situ_linear_beta, inv_lb, lb_active,
             expert_begin, n_local);
         moe_down_combine_kernel<WARPS, false, Blk>

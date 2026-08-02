@@ -438,6 +438,56 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         p.issue.start(devs);
     }
 
+    // ---- position-independent phase replay -------------------------------
+    // ~43% of a token is host issue (SPARKINFER_K3_ISSUE_PROFILE), spread over 192
+    // phase calls. Host `position` reaches the kernels in exactly two places, both
+    // inside MLA attention: the KV row pointer (mla_kv_cache + position*key_length)
+    // and the attention length (position+1). Every other phase enqueues the identical
+    // kernel sequence on the identical buffers each token, so it is captured once and
+    // replayed. MLA attention is never captured, so the position-dependent path is
+    // byte-for-byte the code that shipped. SPARKINFER_K3_GRAPH=0 disables.
+    static const bool graph_on = [] {
+        const char* e = std::getenv("SPARKINFER_K3_GRAPH");
+        return !(e && e[0] == '0');
+    }();
+    auto pos_dependent = [&](int layer, K3LayerPhase ph) {
+        return ph == K3LayerPhase::Attn && !cfg.is_kda_layer(layer);   // MLA only
+    };
+    auto run_phase = [&](KimiK3TPRank& R, int layer, K3LayerPhase ph) -> bool {
+        if (!graph_on || pos_dependent(layer, ph))
+            return kimi_k3_forward_layer_phase(R.fwd, layer, ph, R.x, R.x_next);
+        // x/x_next ping-pong once per layer, and 93 layers is odd, so a token ends
+        // with the pair exchanged: layer L sees the opposite assignment on alternate
+        // tokens. A graph bakes its pointers in, so the cache is keyed on R.x and
+        // holds both parities -- 2 slots per (layer, phase).
+        const size_t base = ((size_t)layer * 4 + (size_t)ph) * 2;
+        const size_t want = (size_t)cfg.n_layers * 4 * 2;
+        if (R.phase_ready.size() != want) {
+            R.phase_graph.assign(want, nullptr);
+            R.phase_exec.assign(want, nullptr);
+            R.phase_ready.assign(want, 0);
+            R.phase_x.assign(want, nullptr);
+        }
+        size_t slot = want;
+        if (R.phase_ready[base] && R.phase_x[base] == R.x)          slot = base;
+        else if (R.phase_ready[base+1] && R.phase_x[base+1] == R.x) slot = base + 1;
+        if (slot == want) {                                  // capture this parity
+            slot = R.phase_ready[base] ? base + 1 : base;
+            if (cudaStreamBeginCapture(R.stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
+                return kimi_k3_forward_layer_phase(R.fwd, layer, ph, R.x, R.x_next);
+            const bool ok = kimi_k3_forward_layer_phase(R.fwd, layer, ph, R.x, R.x_next);
+            cudaGraph_t g = nullptr;
+            if (cudaStreamEndCapture(R.stream, &g) != cudaSuccess || !ok || !g) return false;
+            cudaGraphExec_t e = nullptr;
+            if (cudaGraphInstantiate(&e, g, 0) != cudaSuccess) { cudaGraphDestroy(g); return false; }
+            R.phase_graph[slot] = g; R.phase_exec[slot] = e;
+            R.phase_x[slot] = R.x; R.phase_ready[slot] = 1;
+            // Capture enqueues nothing, so the launch below also makes THIS token correct.
+        }
+        return cudaGraphLaunch(R.phase_exec[slot], R.stream) == cudaSuccess;
+    };
+
+
     // Submit `job` on every rank — concurrently when the pool is up, otherwise
     // in rank order exactly as before. The serial arm keeps its per-call
     // cudaSetDevice; the parallel arm does not need one, because each worker
@@ -515,11 +565,9 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         const IClock::time_point t_p12 = ip.on ? IClock::now() : IClock::time_point{};
         if (!issue_all([&](int r) {
                 KimiK3TPRank& R = p.ranks[(size_t)r];
-                if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::Attn,
-                                                 R.x, R.x_next)) return false;
+                if (!run_phase(R, layer, K3LayerPhase::Attn)) return false;
                 if (attn_reduce) return true;  // FfnPartial waits for the reduce
-                return kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnPartial,
-                                                   R.x, R.x_next);
+                return run_phase(R, layer, K3LayerPhase::FfnPartial);
             })) return false;
         // Closed HERE so t_issue never spans the reduce below; the second issue
         // adds its own span. Letting one bracket cover both would book collective
@@ -555,9 +603,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
             const IClock::time_point t_fp = ip.on ? IClock::now() : IClock::time_point{};
             if (!issue_all([&](int r) {
                     KimiK3TPRank& R = p.ranks[(size_t)r];
-                    return kimi_k3_forward_layer_phase(R.fwd, layer,
-                                                       K3LayerPhase::FfnPartial,
-                                                       R.x, R.x_next);
+                    return run_phase(R, layer, K3LayerPhase::FfnPartial);
                 })) return false;
             if (ip.on) {
                 ip.t_issue += secs_since(t_fp);
@@ -638,8 +684,7 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         const IClock::time_point t_p3 = ip.on ? IClock::now() : IClock::time_point{};
         if (!issue_all([&](int r) {
                 KimiK3TPRank& R = p.ranks[(size_t)r];
-                if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnFinish,
-                                                 R.x, R.x_next)) return false;
+                if (!run_phase(R, layer, K3LayerPhase::FfnFinish)) return false;
                 // Each worker swaps only its OWN rank's pair; no rank reads
                 // another's x, so this needs no synchronisation beyond the
                 // barrier that ends the phase.

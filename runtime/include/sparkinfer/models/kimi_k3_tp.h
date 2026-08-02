@@ -128,6 +128,15 @@ struct KimiK3TPRank {
     float* x = nullptr;              // [hidden]
     float* x_next = nullptr;         // [hidden]
     float* logits = nullptr;         // [vocab], rank 0 only
+
+    // Per-(layer, phase) CUDA graphs for the position-INDEPENDENT phases. The host
+    // spends ~43% of a token issuing ~192 phase calls (SPARKINFER_K3_ISSUE_PROFILE);
+    // every phase except MLA attention replays identically each token, so it is
+    // captured once and replayed. Indexed [layer * 4 + int(phase)].
+    std::vector<cudaGraph_t>     phase_graph;
+    std::vector<cudaGraphExec_t> phase_exec;
+    std::vector<unsigned char>   phase_ready;
+    std::vector<const float*>    phase_x;      // which x this slot captured (ping-pong parity)
 };
 
 struct KimiK3TP {

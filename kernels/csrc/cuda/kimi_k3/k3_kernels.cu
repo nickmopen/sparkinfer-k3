@@ -890,6 +890,9 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
         const Blk* d_row = down_exps + (size_t)(e * latent + o) * blocks_per_row;
         const float* act = scratch + (size_t)k * ffn;
         float acc = 0.0f;
+        // Same dependent-gather chain as the gate/up loop, same fix: four independent
+        // lattice gathers in flight instead of one. Order preserved, bit-identical.
+#pragma unroll 4
         for (int b = 0; b < blocks_per_row; ++b)
             acc += block_dot<XVEC>(d_row[b], act + b * 256, lane, 32);
 #pragma unroll

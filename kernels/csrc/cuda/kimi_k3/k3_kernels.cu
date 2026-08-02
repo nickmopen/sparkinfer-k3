@@ -809,6 +809,16 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     const Blk* u_row = up_exps   + (size_t)(e * ffn + j) * blocks_per_row;
 
     float gacc = 0.0f, uacc = 0.0f;
+    // MEMORY-LEVEL PARALLELISM, not fewer bytes. This kernel runs ~13x off the
+    // bandwidth roofline (~7% of peak), so it is latency-bound, and the reason is
+    // visible in block_dot: with nlanes = 32 each lane runs exactly ONE iteration per
+    // block, and that iteration is a dependent chain -- load qh, load qs, form idx,
+    // gather the 16 KB lattice at a divergent address, then eight FMAs. One gather in
+    // flight per lane, nothing to hide its latency behind. blocks_per_row is a runtime
+    // value so nvcc will not unroll this on its own; asking for four iterations lets it
+    // software-pipeline four independent gathers. The accumulation order is unchanged
+    // -- unrolling replicates iterations in sequence -- so the result is bit-identical.
+#pragma unroll 4
     for (int b = 0; b < blocks_per_row; ++b) {
         const float* xb = x + b * 256;
         gacc += block_dot<XVEC>(g_row[b], xb, lane, 32);
